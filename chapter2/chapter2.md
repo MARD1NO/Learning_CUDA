@@ -109,8 +109,38 @@ __global__ void sumArraysOnHost(float *A, float *B, float *C, const int N){
 CUDA异步调用难以确定具体运行错误的位置，因此我们可以封装一个CHECK宏，包住CUDA API调用，具体可以参考代码
 
 完整的程序可参考 `sumArraysOnGPU-small-case.cu` 
+因为是定义1个块，所以索引可以直接用 `threadIdx.x`， 如果是多个块则数据是错的。
 
 一般情况下，可以基于给定的一维网格和块的信息来得到全局数据的唯一索引，如
 ```cpp
 int i = blockIdx.x*blockDim.x + threadIdx.x
 ```
+
+## 2.2 给核函数计时
+### 2.2.1 用CPU计时器计时
+导入 `sys/time.h` 使用 `gettimeofdat` 函数，它会返回自1970年1月1日零点以来到现在的秒数
+```cpp
+double cpuSecond(){
+    struct timeval tp; 
+    gettimeofday(&tp, NULL);
+    return ((double)tp.tv_sec + (double)tp.tv_usec*1.e-6);
+}
+```
+注意的是CUDA是异步的，所以我们得用 `cudaDeviceSynchornize` 等待所有GPU线程运行结束，再调用。
+具体可以参考 `sumArraysOnGPU-timer.cu` 
+
+不同的设备，对网格和块的限制也不一样
+
+### 2.2.2 用nvprof工具
+用法 
+```shell
+nvprof [nvprof_args] <application> [application_args]
+```
+我们测试上面的程序
+```shell
+nvprof ./xxx
+```
+通信比在高性能计算里十分重要
+如果计算时间大于数据传输的时间，可以进行压缩，并隐藏与传输数据有关的延迟
+反之，则需要尽量减少主机和设备之间的传输
+
