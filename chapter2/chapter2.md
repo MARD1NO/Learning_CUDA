@@ -144,3 +144,42 @@ nvprof ./xxx
 如果计算时间大于数据传输的时间，可以进行压缩，并隐藏与传输数据有关的延迟
 反之，则需要尽量减少主机和设备之间的传输
 
+## 2.3 组织并行线程
+### 2.3.1 使用块和线程建立索引
+这里我们以一个矩阵加法（即2维）为例
+
+我们可以先将线程和块映射到矩阵坐标上
+```
+ix = threadIdx.x + blockIdx.x*blockDim.x
+iy = threadIdx.y + blockIdx.y*blockDim.y
+```
+然后映射到全局索引上
+```
+idx = iy*nx + ix
+```
+
+相关代码可参考 `checkThreadIndex.cu`
+在该代码里，我们指定了一个block的大小是(4, 2)，然后根据公式计算所需的grid数目
+对于一个矩阵来说，就类似划窗的操作
+
+### 2.3.2 使用二维网格和二维块对矩阵求和
+代码可参考 `sumMatrixOnGPU-2D-grid-2D-block.cu`
+
+### 2.3.3 使用一维网格和一维块对矩阵求和
+代码可参考 `sumMatrixOnGPU-1D-grid-1D-block.cu`
+这里只使用了一维网格和一维块，因此我们只会用threadIdx.x
+
+核函数也要进行一个改变，变换成一个以y为变量的循环加
+
+### 2.3.4 使用二维网格和一维块对矩阵求和
+代码可参考 `sumMatrixOnGPU-2D-grid-1D-block.cu`
+
+下面是矩阵坐标的推导
+```cpp
+ix = threadIdx.x(表示第几个线程) + blockIdx.x(在x方向的Block index)*blockDim.x(Block长度)
+iy = blockIdx.y(在y方向的Block index)
+```
+
+从以上例子可以得出
+- 相同网格和块下，不同执行配置，运行效率不同
+- 不同网格和块的分配下，运行效率不同
