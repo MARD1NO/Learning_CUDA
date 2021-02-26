@@ -40,11 +40,13 @@ void sumArraysOnHost(float *A, float *B, float *C, const int N){
     }
 }
 
-__global__ void sumArraysOnGPU(float *A, float *B, float *C){
+__global__ void sumArraysOnGPUv2(float *A, float *B, float *C){
     // Do elementwise add
     // int idx = threadIdx.x;
-    int idx = blockIdx.x*blockDim.x + threadIdx.x;
-    C[idx] = A[idx] + B[idx];
+    int idx = (blockIdx.x*blockDim.x + threadIdx.x)*2;
+    for(int i=0; i<2; i++){
+       C[idx+i] = A[idx+i] + B[idx+i]; 
+    }
 }
 
 void initialData(float *ip, int size){
@@ -91,17 +93,16 @@ int main(){
     cudaMemcpy(d_A, h_A, nBytes, cudaMemcpyHostToDevice);
     cudaMemcpy(d_B, h_B, nBytes, cudaMemcpyHostToDevice);
 
-    // invoke kernel at host side
     int iLen = 256; 
     dim3 block(iLen);
-    dim3 grid((nElem+block.x-1)/block.x);
+    dim3 grid((nElem+block.x-1)/block.x/2);
 
     double iStart = cpuSecond();
-    sumArraysOnGPU<<<grid, block>>>(d_A, d_B, d_C);
+    sumArraysOnGPUv2<<<grid, block>>>(d_A, d_B, d_C);
     cudaDeviceSynchronize(); 
     double iElaps = cpuSecond() - iStart;
     printf("Sum array on GPU <<<%d, %d>>> Time elapsed %f sec \n", grid.x, block.x, iElaps);
-    
+
     // copy kernel result back to host side
     cudaMemcpy(gpuRef, d_C, nBytes, cudaMemcpyDeviceToHost);
 
@@ -110,7 +111,6 @@ int main(){
     sumArraysOnHost(h_A, h_B, hostRef, nElem);
     iElaps = cpuSecond() - iStart;
     printf("Sum array on CPU Time elapsed %f sec \n", iElaps);
-
 
     // check device results
     checkResult(hostRef, gpuRef, nElem);
