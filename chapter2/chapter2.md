@@ -48,8 +48,11 @@ nvcc -Xcompiler -std=c99 sumArraysOnHost.c -o sum
 ### 2.1.3 线程管理
 CUDA将线程层次结构抽象成 `线程块网格Grid` 和 `线程块Block` 这两层。
 
-一个线程块block由多个thread线程组成
+**一个内核启动所产生的所有线程统称为一个网格Grid**，同一网格中的所有线程共享相同的全局内存空间
+
 一个线程网格grid由多个block组成
+
+一个线程块block由多个thread线程组成
 
 同一线程块内的线程协作通过 `同步` 和 `共享内存` 来实现的。
 
@@ -71,6 +74,16 @@ CUDA内核调用服从如下方式
 
 ```cpp
 kernel_name <<<grid, block>>>(argument list)
+```
+
+第一个值是网格维度，也就是**线程块的个数**
+
+第二个值是线程维度，也就是**每个块的线程数目**
+
+如果需要计算32个元素，我们可以分配8个块，每个块有4个线程，形式如下
+
+```c++
+kernel<<<8, 4>>>(...)
 ```
 
 核函数的调用与主机线程是异步的。即**核函数调用结束后，控制权立刻返回给主机端**
@@ -146,9 +159,18 @@ nvprof ./xxx
 
 ## 2.3 组织并行线程
 ### 2.3.1 使用块和线程建立索引
-这里我们以一个矩阵加法（即2维）为例
+这里我们以一个8 x 6的矩阵为例
 
-我们可以先将线程和块映射到矩阵坐标上
+![matrix](../img/chapter2/matrix.jpg)
+
+我们为此分配4x2大小的线程块，每个线程块分配2x3大小的线程
+
+对应到矩阵上就是
+
+![matrix](../img/chapter2/matrix_block.jpg)
+
+以这种形式组织的时候，我们计算坐标的公式如下
+
 ```
 ix = threadIdx.x + blockIdx.x*blockDim.x
 iy = threadIdx.y + blockIdx.y*blockDim.y
@@ -163,9 +185,38 @@ idx = iy*nx + ix
 对于一个矩阵来说，就类似划窗的操作
 
 ### 2.3.2 使用二维网格和二维块对矩阵求和
+
+坐标的推算跟上面一致
+
 代码可参考 `sumMatrixOnGPU-2D-grid-2D-block.cu`
 
 ### 2.3.3 使用一维网格和一维块对矩阵求和
+此时架构变成一维网格和一维线程块
+
+![BLOCK1D](../img/chapter2/block1d.jpg)
+
+这就意味着每个线程不像之前一样，只需要处理一个元素，此时它还需要处理y方向的元素
+
+还是以8 x 6的矩阵为例子，我们分配2个块，每个块有4个线程
+
+![BLOCK1D](../img/chapter2/1D-grid-1D-block.jpg)
+
+我们确定index，首先确立X方向的
+
+```cpp
+ix = threadIdx.x + blockIdx.x*blockDim.x;
+```
+
+然后每个线程，需要处理y方向的6个元素，因此我们需要一个for循环去执行
+
+```cpp
+ny = 6;
+nx = 8
+for(int iy=0; iy<ny; iy++){
+	int idx = iy*nx + ix; // 得到对应的索引
+}
+```
+
 代码可参考 `sumMatrixOnGPU-1D-grid-1D-block.cu`
 这里只使用了一维网格和一维块，因此我们只会用threadIdx.x
 
