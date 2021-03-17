@@ -306,8 +306,6 @@ nvprof --metrics gld_throughput ./sumMatrix 32 32
 1. 相邻配对：元素直接和相邻的元素配对
 2. 交错配对：给定步长stride配对元素
 
-下图分别是相邻配对和交错配对
-
 代码可参考 `recursiveReduceCPU.cpp`
 
 ## 3.4.2 并行归约中的分化
@@ -319,7 +317,10 @@ int *idata = g_idata + blockDim.x*blockIdx.x;
 ```
 **针对不同的块，对输入指针进行偏移**，偏移量为 块的index * 块的大小
 
+![neighbour](../img/chapter3/reduce_int_v1.jpg)
+
 我们的基准算法是相邻配对，可以从图看到，是偶数项线程在做部分求和的操作，因此在代码中
+
 ```cpp
 if((tid % (2*stride)==0))
 ```
@@ -337,10 +338,15 @@ int index = 2*stride*tid;
 ```
 此时就避免了线程束分化，假设块有512个线程，那它有16个线程束，第一轮求部分和，前8个线程束在调用，第二轮求部分和只有前4个线程束在调用，以此类推。
 
+![neighbour2](../img/chapter3/reduce_int_v2.jpg)
+
 **但到了最后几轮，每一轮的线程总数小于线程束大小时，还是会出现分化**
 
 ## 3.4.4 交错配对的归约
 交错配对的归约主要是步长上的区别，具体表现在
+
+![Interleaved](../img/chapter3/reduce_int_v3.jpg)
+
 ```cpp
 for(int stride = blockDim.x / 2; stride > 0; stride >>=1){
     if(tid < stride){
@@ -473,6 +479,8 @@ nvcc -arch=sm_35 -rdc=true nestedHelloWorld.cu -o nestedHelloWorld -lcudadevrt
 ## 3.6.3 嵌套归约
 归约可以看作是一个递归函数，我们用前面的思想来创建，我们以交错配对的形式展开，每一次递归，让第0个线程产生一个只有一个线程块，且线程数大小为当前线程块一半线程数量的子网格。
 
+![recursive1](../img/chapter3/recursive_reduce_v1.jpg)
+
 具体可参考代码 `nestedReduce.cu` 的 `gpuRecursiveReduce`函数
 
 由于构建了大量线程块，且使用了 `__syncthreads`，导致内核效率低下
@@ -481,8 +489,9 @@ nvcc -arch=sm_35 -rdc=true nestedHelloWorld.cu -o nestedHelloWorld -lcudadevrt
 
 去除同步的核函数为 `gpuRecursiveReduceNosync.cu`
 
-
 另外我们展示了另外一个方法，当创建子网格的数量减少时，通过增加每个子网格的线程块数来保证并行性
+
+![recursive2](../img/chapter3/recursive_reduce_v2.jpg)
 
 **该核函数多了一个参数，即iDim，表示父线程的维度。因为每次嵌套调用，子线程的大小会减到父线程大小的一半，为了计算出正确的内存偏移地址，需要父线程块维度大小**。 
 
