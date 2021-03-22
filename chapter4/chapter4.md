@@ -124,3 +124,160 @@ cudaError_t cudaMemcpyToSymbol(const void* symbol, const void* src, size_t count
 
 一般情况下，用来满足内存请求的事务越多，未使用的字节被传输回的可能性越高，这就造成数据吞吐量降低
 
+### 4.1.2.9 静态全局内存
+可参考 `globalVariable.cu` 文件
+
+需要注意的是
+- cudaMemcpyToSymbol 函数是存在CUDA运行时API中的，可以使用GPU硬件来访问
+- devData作为一个标识符，并不是设备全局内存的变量地址
+- 核函数中，devData被当作全局内存中的一个变量
+
+下面这种写法是错误的
+```cpp
+cudaMemcpy(&devData, &value, sizeof(float), cudaMemcpyHostToDevice)
+```
+我们不能在主机端的设备变量中使用运算符 &，因为它只是一个在GPU上表示物理位置符号。
+
+但我们可以使用下面的函数来获取全局变量的地址
+```cpp
+cudaError_t cudaGetSymbolAddress(void** devPtr, const void* symbol)
+```
+完整代码如下
+```cpp
+float *dptr = NULL; 
+cudaGetSymbolAddress((void**)&dptr, devData);
+cudaMemcpy(dptr, &value, sizeof(float), cudaMemcpyHostToDevice);
+```
+
+在CUDA编程中，一般情况下设备核函数不能访问主机变量，主机函数也不能访问设备变量，即使这些变量在同一文件作用域下声明。
+
+# 4.2 内存管理
+## 4.2.1 内存分配和释放
+我们在主机上使用下列函数分配全局内存
+```cpp
+cudaError_t cudaMalloc(void **devPtr, size_t count);
+```
+该函数分配了count字节的全局内存，并用devptr指针**返回该内存的地址**（即地址的地址）
+
+我们可以用
+```cpp
+cudaError_t cudaMemset(void *devPtr, int value, size_t count);
+```
+来初始化设备内存
+
+释放的时候调用`cudaFree(void *devPtr)`
+
+设备内存的分配和释放操作成本较高，所以应用程序应重利用设备内存，以减少对整体性能的影响
+
+## 4.2.2 内存传输
+使用
+```cpp
+cudaError_t cudaMemcpy(void *dst, const void *src, size_t count, enum cudaMemcpyKind kind);
+```
+从主机向设备传输数据
+
+kind表示的是复制方向，有
+- cudaMemcpyHostToHost
+- cudaMemcpyHostToDevice
+- cudaMemcpyDeviceToHost
+- cudaMemcpyDeviceToDevice
+
+CUDA编程的基本原则是尽可能减少主机与设备之间的传输
+
+## 4.2.3 固定内存
+GPU不能直接在可分页主机内存上安全地访问数据
+
+当从可分页主机内存传输数据到设备内存是时，CUDA首先分配临时页面锁定的或固定的主机内存，将主机源数据分配到固定内存中，然后从固定内存传输数据给设备内存
+
+但是CUDA提供了一个函数
+```cpp
+cudaError_t cudaMallocHost(void **devptr, size_t count)
+```
+该函数分配了count字节的主机内存，**这些内存是页面锁定的并且对设备来说是可访问的**
+
+固定内存能被设备直接访问，所以它能用比**可分页内存高得多的带宽**进行读写，然而，**分配过多的固定内存可能会降低主机系统的性能**，因为它减少了用于存储虚拟内存数据的可分页内存的数量
+```cpp
+cudaError_t status = cudaMallocHost((void **)&h_aPinned, bytes);
+if (status != cudaSuccess){
+    fprintf(stderr, "Error returned from pinned host memory allocation \n");
+    exit(1);
+}
+```
+固定主机内存需通过
+```cpp 
+cudaError_t cudaFreeHost(void *ptr);
+```
+来释放
+
+tips: 
+与可分页内存相比，固定内存的分配和释放成本更高，但它为大规模数据传输提供更高的传输吞吐量
+应该尽可能地减少或重叠主机和设备间的数据传输
+
+## 4.2.4 零拷贝内存
+主机和设备不能互相访问各自的变量，但有个例外是**零拷贝内存**，主机和设备都可以访问
+
+CUDA核函数中使用零拷贝内存有以下优势
+- 当设备内存不足时可利用主机内存
+- 避免主机和设备间的显式数据传输
+- 提高PCIE传输速率
+
+使用零拷贝内存时，必须**同步主机和设备间的内存访问**
+
+零拷贝内存是固定内存，使用下面函数创建一个到固定内存的映射
+```cpp
+cudaError_t cudaHostAlloc(void **pHost, size_t count, unsigned int flags);
+```
+
+flags参数包括
+- cudaHostAllocDefault 使cudaHostAlloc函数行为与cudaMallocHost函数一致
+- cudaHostAllocPortable 返回能被所有CUDA上下文使用的固定内存
+- cudaHostAllocWriteCombined 返回写结合内存，该内存可以在某些系统配置上通过PCIe总线上更快地传输，但是它在大多数主机上不能被有效读取，写结合内存是缓冲区的一个很好的选择
+- cudaHostAllocMapped 返回主机写入和设备读取被映射到设备地址空间中的主机内存
+
+```cpp
+cudaError_t cudaHostGetDevicePointer(void **pDevice, void *pHost, unsigned int flags);
+```
+该函数返回了一个在pDevice中的设备指针，该指针可以在设备上被引用以访问映射得到的固定主机内存
+
+在进行频繁的读写操作时，**使用零拷贝内存作为设备内存的补充会显著降低性能，因为映射到内存的传输必须经过PCIe总线。**
+
+```cpp
+CHECK(cudaHostAlloc((void **)&h_A, nBytes, cudaHostAllocMapped));
+CHECK(cudaHostAlloc((void **)&h_B, nBytes, cudaHostAllocMapped));
+// pass the pointer to device
+CHECK(cudaHostGetDevicePointer((void **)&d_A, (void *)h_A, 0));
+CHECK(cudaHostGetDevicePointer((void **)&d_B, (void *)h_B, 0));
+```
+
+tips: 
+异构计算系统架构分为集成架构和离散架构
+集成架构即CPU和GPU集成在一个芯片上，在物理地址上共享主存，此时无需在PCIe总线上备份，零拷贝内存在编程和性能上更佳
+而离散架构下，设备通过PCIe总线连接到主机，零拷贝内存仅在某些情况下有优势
+
+## 4.2.5 统一虚拟地址
+统一虚拟寻址UVA可以让主机内存和设备内存共享同一个虚拟地址空间。
+
+在之前的零拷贝例子中，我们需要
+1. 分配映射的固定主机内存
+2. 使用CUDA运行时函数`cudaHostGetDevicePointer`获取映射到固定内存的设备指针
+3. 将设备指针传递给核函数
+
+而有了UVA，我们无需获取设备指针，可以直接
+```cpp
+CHECK(cudaHostAlloc((void **)&h_A, nBytes, cudaHostAllocMapped));
+CHECK(cudaHostAlloc((void **)&h_B, nBytes, cudaHostAllocMapped));
+
+initialData(h_A, nElem);
+initialData(h_B, nElem);
+
+sumArraysZeroCopy<<<grid, block>>>(h_A, h_B, d_C, nElem);
+```
+
+## 4.2.6 统一内存寻址
+统一内存中创建了托管内存池，内存池中已分配的空间可以用相同的内存地址在CPU和GPU上进行访问。底层系统在统一内存空间中自动在主机和设备之间进行数据传输。
+
+托管内存可以通过静态分配（即添加 `__managed__` 注释），也可以动态分配，即
+```cpp
+cudaError_t cudaMallocManaged(void **devPtr, size_t size, unsigned int flags=0)
+```
+
