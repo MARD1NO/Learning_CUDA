@@ -281,3 +281,304 @@ sumArraysZeroCopy<<<grid, block>>>(h_A, h_B, d_C, nElem);
 cudaError_t cudaMallocManaged(void **devPtr, size_t size, unsigned int flags=0)
 ```
 
+# 4.3 内存访问模式
+大多数设备端数据访问都是从全局内存开始，因此最大限度利用全局内存带宽是调控核函数性能的基本。
+
+## 4.3.1 对齐与合并访问
+核函数的内存请求通常是在DRAM设备和片上内存间以128字节或32字节内存事务实现的
+
+对全局内存的访问都会通过二级缓存，也有部分会通过一级缓存。如果两个缓存都用到，则内存访问是由一个128字节的内存事务实现的，如果只使用了二级缓存，则内存访问时由一个32字节的内存事务实现的
+
+一行一级缓存是128个字节，若线程束每个线程请求一个4字节的值，则每次请求获取128字节数据，恰好对应。
+
+我们需要注意设备内存访问的特性： 
+1. 对齐内存访问
+2. 合并内存访问
+
+（若启用缓存）当设备内存事务的第一个地址是用于事务服务的缓存粒度的偶数倍时（二级缓存是32字节，一级缓存是128字节），就会出现对齐内存访问
+
+当一个线程束中全部的32个线程访问一个连续的内存块时，就会出现合并内存访问。
+
+## 4.3.2 全局内存读取
+SM中，数据通过以下3种缓存进行传输：
+1. 一级和二级缓存
+2. 常量缓存
+3. 只读缓存
+
+可以使用编译器标志禁用一级缓存
+```shell
+-Xptxas -dlcm=cg # 禁用
+-Xptxas -dlcm=ca # 启用
+```
+
+总结下，内存加载分为两类
+1. 缓存加载（即启用一级缓存）
+2. 没有缓存加载（即禁用一级缓存）
+如果启用一级缓存，则内存加载被缓存
+
+**对齐与非对齐：若内存访问的第一个地址是32字节的倍数，则是对齐加载**
+
+**合并与未合并：若线程束访问一个连续的数据块，则加载合并**
+
+### 4.3.2.1 缓存加载
+GPU一级缓存是专为空间局部性而不是为时间局部性设计的，**频繁访问一个一级缓存的内存位置不会增加数据留在缓存中的概率**
+
+
+### 4.3.2.2 没有缓存加载
+不经过一级缓存，所以它在内存段的粒度上（32个字节）而不是缓存池的粒度上（128个字节）。这种细粒度的加载相较于有缓存的情况下，**对于非对齐和非合并的内存访问有更好的总线利用率**
+
+### 4.3.2.3 非对齐读取的示例
+可参考代码 `readSegment.cu`
+
+我们可以用
+```shell
+nvprof --devices 0 --metrics gld_transactions ./readSegment
+```
+来获取gld_efficiency指标
+
+#### 4.3.2.4 只读缓存
+对于计算能力为3.5及以上的GPU来说，只读缓存支持使用全局内存加载代替一级缓存
+
+只读缓存的加载粒度为32个字节，跟前面内存读取类似，这种更细粒度的加载要优于一级缓存
+
+有两种方式让内存通过只读缓存进行读取： 
+1. 使用函数 _ldg
+```cpp
+__global__ void copyKernel(int *out, int *in){
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    out[idx] = __ldg(&in[idx]);
+}
+```
+
+2. 在间接引用的指针上使用修饰符`__restrict__`
+```cpp
+__global__ void copyKernel(int * __restrict__ out, const int * __restrict__ in){
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    out[idx] = in[idx];
+}
+```
+
+## 4.3.3 全局内存写入
+可参考 `writeSegment.cu`
+
+## 4.3.4 结构体数组与数组结构体
+定义一个数组结构体
+```cpp
+struct innerStruct{
+    float x;
+    float y;
+};
+
+struct innerStruct myAOS[N];
+
+// 其内存组织形式如： x y x y x y x y
+```
+然后我们看下结构体数组
+```cpp
+struct innerArray{
+    float x[N];
+    float y[N];
+};
+
+// 其内存组织形式如： x x x x y y y y 
+```
+如果应用程序只需要一个X，那么数组结构体有一半带宽被浪费了（因为有一半需要加载Y），而结构体数组则能利用满带宽。
+
+并行编程如SIMD,CUDA偏向使用结构体数组
+
+关于数组结构体和结构体数组的对比，可分别参考`simpleMathAoS.cu`和`simpleMathSoA.cu`
+
+## 4.3.5 性能调整
+优化设备内存带宽利用率有两个目标：
+- 对齐及合并内存访问，以减少带宽的浪费
+- 足够的并发内存操作，以隐藏内存延迟
+
+实现并发内存访问最大化方式是通过： 
+1. 增加每个线程中执行独立内存操作的数量
+2. 对核函数启动的执行配置进行实验，以充分体现每个SM的并行性
+
+### 4.3.5.1 展开技术
+我们可以跟让每个线程都执行4个独立的内存操作
+```cpp
+__global__ void readOffsetUnroll4(float *A, float *B, float *C, const int n, int offset){
+    unsigned int i = blockIdx.x * blockDim.x * 4 + threadIdx.x; 
+    unsigned int k = i + offset; 
+
+    if(k < n){
+        C[i] = A[k]+B[k];
+    }
+    if(k + blockDim.x < n){
+        C[i+blockDim.x] = A[k+blockDim.x] + B[k+blockDim.x];
+    }
+    if(k + blockDim.x*2 < n){
+        C[i+blockDim.x*2] = A[k+blockDim.x*2] + B[k+blockDim.x*2];
+    }
+    if(k + blockDim.x*3 < n){
+        C[i+blockDim.x*3] = A[k+blockDim.x*3] + B[k+blockDim.x*3];
+    }
+}
+```
+### 4.3.5.2 增大并行性
+修改核函数的执行配置
+
+# 4.4 核函数可达到的带宽
+一个原本不好的访问模式，仍然可以通过重新设计核函数中的几个部分以实现良好的性能
+
+## 4.4.1 内存带宽
+我们一般有两种类型的带宽： 
+1. 理论带宽，当前硬件可以实现的绝对最大带宽
+2. 有效带宽，即 (读字节数+写字节数)*10^9 / 运行时间
+
+## 4.4.2 矩阵转置问题
+一段cpp代码示例为
+```cpp
+void transposeHost(float *out, float *in, const int nx, const int ny){
+    for(int iy=0; iy<ny; ++iy){
+        for(int ix=0; ix<nx; ++ix){
+            out[ix*ny+iy] = in[iy*nx+ix];
+        }
+    }
+}
+```
+
+读：对原矩阵按行读取，是合并访问
+写：对转置矩阵的列访问，是交叉访问
+
+我们会考虑两种方法：即按行读取按列存储，按列读取按行存储
+
+如果禁用一级缓存，这两种实现的性能理论上是一致的。如果开启一级缓存，则第二种方法可能会更好（因为按列读取是**不合并的**，开启一级缓存后，下次读取可能直接缓存上执行）
+
+### 4.4.2.1 为转置核函数设置性能的上限和下限
+我们使用矩阵拷贝来作为一个性能的上下限，其中上限就是让矩阵按行拷贝，下限就是让矩阵按列拷贝
+
+行拷贝实现如下
+```cpp
+__global__ void copyRow(float *out, float *in, const int nx, const int ny){
+    unsigned int ix = blockDim.x*blockIdx.x + threadIdx.x; 
+    unsigned int iy = blockDim.y*blockIdx.y + threadIdx.y; 
+    if(ix < nx && iy < ny){
+        out[iy*nx + ix] = in[iy*nx + ix];
+    }
+}
+```
+列拷贝如下
+```cpp
+__global__ void copyCol(float *out, float *in, const int nx, const int ny){
+    unsigned int ix = blockDim.x*blockIdx.x + threadIdx.x; 
+    unsigned int iy = blockDim.y*blockIdx.y + threadIdx.y;
+
+    if(ix < nx && iy < ny){
+        out[ix*ny+iy] = in[ix*ny + iy];
+    }
+}
+```
+
+### 4.4.2.2 朴素转置：读取行与读取列
+```cpp
+__global__ void transposeNaiveRow(float *out, float *in, const int nx, const int ny){
+    unsigned int ix = blockDim.x * blockIdx.x + threadIdx.x; 
+    unsigned int iy = blockDim.y * blockIdx.y + threadIdx.y; 
+
+    if(ix < nx && iy < ny){
+        out[ix*ny + iy] = in[iy*nx + ix];
+    }
+}
+```
+我们互换一下索引，就有读取列与存储行的转置形式
+```cpp
+__global__ void transposeNaiveCol(float *out, float *in, const int nx, const int ny){
+    unsigned int ix = blockDim.x * blockIdx.x + threadIdx.x; 
+    unsigned int iy = blockDim.y * blockIdx.y + threadIdx.y; 
+
+    if(ix < nx && iy < ny){
+        out[iy*nx + ix] = in[ix*ny + iy];
+    }
+}
+```
+### 4.4.2.3 展开转置：读取行与读取列
+接下来我们利用展开技术来提高转置内存带宽的利用率
+
+下面代码展示的是读取行，存储列的形式
+```cpp
+__global__ void transposeUnroll4Row(float *out, flaot *in, const int nx, const int ny){
+    unsigned int ix = 4* blockDim.x * blockIdx.x + threadIdx.x; 
+    unsigned int iy = blockDim.y * blockIdx.y + threadIdx.y; 
+
+    unsigned int ti = iy * nx + ix; 
+    unsigned int to = ix * ny + iy; 
+
+    if (ix+3*blockDim.x < nx && iy < ny){
+        out[to] = in[ti]; 
+        out[to + blockDim.x*ny] = in[ti + blockDim.x]; 
+        out[to + 2*blockDim.x*ny] = in[ti + 2*blockDim.x]; 
+        out[to + 2*blockDim.x*ny] = in[ti + 2*blockDim.x]; 
+    }
+}
+```
+下面代码展示的是读取列，存储行的形式
+```cpp
+__global__ void transposeUnroll4Col(float *out, float *in, const int nx, const int ny){
+    unsigned int ix = 4* blockDim.x * blockIdx.x + threadIdx.x; 
+    unsigned int iy = blockDim.y * blockIdx.y + threadIdx.y; 
+
+    unsigned int ti = iy*nx + ix;
+    unsigned int to = ix*ny + iy;
+
+    if(ix + 3*blockDim.x < nx && iy < ny){
+        out[ti] = in[to];
+        out[ti + blockDim.x] = in[to + blockDim.x*ny];
+        out[ti + 2*blockDim.x] = in[to + 2*blockDim.x*ny];
+        out[ti + 2*blockDim.x] = in[to + 3*blockDim.x*ny];
+    }
+}
+```
+
+### 4.4.2.4 对角转置
+虽然CUDA编程模型可以对网格抽象为一维和二维，但本质上都是一维。每个线程块的唯一bid可以计算为
+```cpp
+unsigned int bid = gridDim.x*blockIdx.y + blockIdx.x;
+```
+
+对角坐标和笛卡尔坐标的转换为：
+```cpp
+block_x = (blockIdx.x + blockIdx.y) % gridDim.x;
+block_y = blockIdx.x
+```
+其中blockIdx.x和blockIdx.y为对角坐标，block_x和block_y是笛卡尔坐标。（因为数据读取，最后我们还是要转换回来），使用映射回来的笛卡尔坐标来计算线程索引
+```cpp
+__global__ void transposeDiagonalRow(float *out, float *in, const int nx, const int ny){
+    unsigned int blk_y = blockIdx.x; 
+    unsigned int blk_x = (blockIdx.x + blockIdx.y) % gridDim.x; 
+
+    unsigned int ix = blockDim.x * blk_x + threadIdx.x; 
+    unsigned int iy = blockDim.y * blk_y + threadIdx.y; 
+
+    if(ix < nx && iy < ny){
+        out[ix*ny + iy] = in[iy*nx + ix];
+    }
+}
+```
+同理换一下坐标就得到了基于列的对角坐标核函数
+
+性能提升的原因与**DRAM的并行访问有关**，当使用笛卡尔坐标将线程块映射到数据块时，全局内存访问可能无法均匀到整个DRAM的 从分区 中，这时可能会出现**分区冲突**的现象。
+而使用对角坐标后，由于是非线性映射，所以交叉访问不太可能会落入到一个独立的分区中。
+
+### 4.4.2.5 使用瘦块来增加并行性
+基于列的方法，可以使用`瘦块`来存储在线程块中连续元素的数量，提高存储操作的效率
+
+# 4.5 使用统一内存的矩阵加法
+我们可以使用统一内存来简化矩阵加法的代码
+
+```cpp
+float *A, *B, *gpuRef; 
+cudaMallocManaged((void**) &A, nBytes);
+cudaMallocManaged((void**) &B, nBytes);
+cudaMallocManaged((void**) &gpuRef, nBytes);
+initialData(A, nxy); 
+initialData(B, nxy); 
+sumMatrixGPU<<<grid, block>>>(A, B, gpuRef, nx, ny);
+cudaDeviceSynchronize();
+```
+
+这里笔者在2080Ti测试与书中结果相反，个人猜测统一内存的效率与架构强相关（书中使用的是kepler架构）
+
