@@ -534,6 +534,9 @@ __global__ void transposeUnroll4Col(float *out, float *in, const int nx, const i
 ```
 
 ### 4.4.2.4 对角转置
+
+![对角](../img/chapter4/diagonal.jpg)
+
 虽然CUDA编程模型可以对网格抽象为一维和二维，但本质上都是一维。每个线程块的唯一bid可以计算为
 ```cpp
 unsigned int bid = gridDim.x*blockIdx.y + blockIdx.x;
