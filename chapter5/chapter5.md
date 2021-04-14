@@ -168,3 +168,78 @@ nvprof ./checkSmemSquare
 ### 5.2.1.2 行主序写和列主序读
 我们只需在给输出数组赋值，交换索引即可
 
+### 5.2.1.3 动态共享内存
+动态共享内存可以声明在核函数外/内，使其作用域分别是全局/局部
+
+动态共享内存必须被声明为一个**未定大小的一维数组**
+
+```cpp
+__global__ void setRowReadColDyn(int *out){
+    extern __shared__ int tile[];
+
+    unsigned int row_idx = threadIdx.y * blockDim.x + threadIdx.x;
+    unsigned int col_idx = threadIdx.x * blockDim.y + threadIdx.y;
+
+    tile[row_idx] = row_idx;
+    __syncthreads();
+    out[row_idx] = tile[col_idx];
+}
+```
+
+### 5.2.1.4 填充静态声明的共享内存
+前面有提到过，增加一列，可以让列元素分布在不同的存储体内，避免冲突（针对Fermi设备，不同设备所需填充不同）
+```cpp
+__shared__ int tile[BDIMY][BDIMX+1];
+```
+
+### 5.2.1.5 填充动态声明的共享内存
+我们计算索引的时候，每一行要多跳过一个填充的内存空间
+```cpp
+unsigned int row_idx = threadIdx.y * (blockDim.x + 1) + threadIdx.x;
+unsigned int col_idx = threadIdx.x * (blockDim.x + 1) + threadIdx.y;
+```
+
+## 5.2.2 矩形共享内存
+### 5.2.2.1 行主序访问与列主序访问
+与前面的主要区别是，行主序的共享内存还是
+```cpp
+__shared__ int tile[BDIMY][BDIMX];
+```
+而列主序是
+```cpp
+__shared__ int tile[BDIMX][BDIMY];
+```
+
+### 5.2.2.2 行主序写操作和列主序读操作
+我们实现一个矩阵转置操作
+首先计算全局ID
+```cpp
+unsigned int idx = threadIdx.y * blockDim.x + threadIdx.x;
+```
+此时我们的矩阵是矩形而不是前面的方形，转置过后我们需要重新计算坐标
+```cpp
+unsigned int irow = idx / blockDim.y;
+unsigned int icol = idx % blockDim.y;
+```
+完整代码如下
+```cpp
+__global__ void setRowReadCol(int *out)
+{
+    __shared__ int tile[BDIMY][BDIMX];
+    unsigned int idx = threadIdx.y * blockDim.x + threadIdx.x;
+    unsigned int irow = idx / blockDim.y;
+    unsigned int icol = idx % blockDim.y;
+    tile[threadIdx.y][threadIdx.x] = idx;
+    __syncthreads();
+    out[idx] = tile[icol][irow];
+}
+```
+### 5.2.2.3 动态声明的共享内存
+因为动态声明的共享内存只能是一维的，所以我们在前面的基础上，还要再计算出一个一维索引
+```cpp
+unsigned int idx = threadIdx.y * blockDim.x + threadIdx.x;
+unsigned int irow = idx / blockDim.y;
+unsigned int icol = idx % blockDim.y;
+unsigned int col_idx = icol * blockDim.x + irow;
+```
+

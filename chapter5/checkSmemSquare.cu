@@ -46,6 +46,39 @@ __global__ void setRowReadCol(int *out){
     out[idx] = tile[threadIdx.x][threadIdx.y];
 }
 
+__global__ void setRowReadColDyn(int *out){
+    extern __shared__ int tile[];
+
+    unsigned int row_idx = threadIdx.y * blockDim.x + threadIdx.x;
+    unsigned int col_idx = threadIdx.x * blockDim.y + threadIdx.y;
+
+    tile[row_idx] = row_idx;
+    __syncthreads();
+    out[row_idx] = tile[col_idx];
+}
+
+__global__ void setRowReadColPad(int *out){
+    __shared__ int tile[BDIMY][BDIMX+IPAD];
+    unsigned int idx = threadIdx.y * blockDim.x + threadIdx.x;
+    tile[threadIdx.y][threadIdx.x] = idx;
+
+    __syncthreads();
+    out[idx] = tile[threadIdx.y][threadIdx.x];
+}
+
+__global__ void setRowReadColDynPad(int *out){
+    extern __shared__ int tile[];
+
+    unsigned int row_idx = threadIdx.y * (blockDim.x + 1) + threadIdx.x;
+    unsigned int col_idx = threadIdx.x * (blockDim.x + 1) + threadIdx.y;
+
+    unsigned int g_idx = threadIdx.y * blockDim.x + threadIdx.x;
+
+    tile[row_idx] = g_idx;
+    __syncthreads();
+    out[g_idx] = tile[col_idx];
+}
+
 int main(int argc, char** argv){
     int dev = 0;
     cudaDeviceProp deviceProp;
@@ -88,6 +121,21 @@ int main(int argc, char** argv){
     setRowReadCol<<<grid, block>>>(d_C);
     CHECK(cudaMemcpy(gpuRef, d_C, nBytes, cudaMemcpyDeviceToHost));
     if(iprintf)  printData("set row read col: ", gpuRef, nx * ny);
+
+    CHECK(cudaMemset(d_C, 0, nBytes));
+    setRowReadColDyn<<<grid, block, BDIMX*BDIMY*sizeof(int)>>>(d_C);
+    CHECK(cudaMemcpy(gpuRef, d_C, nBytes, cudaMemcpyDeviceToHost));
+    if(iprintf)  printData("set row read col dyn", gpuRef, nx * ny);
+
+    CHECK(cudaMemset(d_C, 0, nBytes));
+    setRowReadColPad<<<grid, block>>>(d_C);
+    CHECK(cudaMemcpy(gpuRef, d_C, nBytes, cudaMemcpyDeviceToHost));
+    if(iprintf)  printData("set row read col pad", gpuRef, nx * ny);
+
+    CHECK(cudaMemset(d_C, 0, nBytes));
+    setRowReadColDynPad<<<grid, block, (BDIMX + IPAD)*BDIMY*sizeof(int)>>>(d_C);
+    CHECK(cudaMemcpy(gpuRef, d_C, nBytes, cudaMemcpyDeviceToHost));
+    if(iprintf)  printData("set row read col DP ", gpuRef, nx * ny);
 
     CHECK(cudaFree(d_C)); 
     free(gpuRef);
