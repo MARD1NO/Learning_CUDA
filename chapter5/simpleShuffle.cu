@@ -1,0 +1,221 @@
+#include "../common/common.h"
+#include <stdio.h>
+#include <cuda_runtime.h>
+
+#define BDIMX 16
+#define SEGM  4
+
+void printData(int *in, const int size)
+{
+    for (int i = 0; i < size; i++)
+    {
+        printf("%2d ", in[i]);
+    }
+    printf("\n");
+}
+
+__global__ void test_shfl_broadcast(int *d_out, int *d_in, int const srcLane){
+    int value = d_in[threadIdx.x];
+    value = __shfl(value, srcLane, BDIMX);
+    d_out[threadIdx.x] = value;
+}
+
+__global__ void test_shfl_up(int *d_out, int *d_in, unsigned int const delta){
+    int value = d_in[threadIdx.x];
+    value = __shfl_up(value, delta, BDIMX);
+    d_out[threadIdx.x] = value;
+}
+
+__global__ void test_shfl_down(int *d_out, int *d_in, unsigned int const delta){
+    int value = d_in[threadIdx.x];
+    value = __shfl_down(value, delta, BDIMX);
+    d_out[threadIdx.x] = value;
+}
+
+__global__ void test_shfl_wrap(int *d_out, int *d_in, int const offset){
+    int value = d_in[threadIdx.x];
+    value = __shfl(value, threadIdx.x+offset, BDIMX);
+    d_out[threadIdx.x] = value;
+}
+
+__global__ void test_shfl_xor(int *d_out, int *d_in, int const mask){
+    int value = d_in[threadIdx.x];
+    value = __shfl_xor(value, mask, BDIMX);
+    d_out[threadIdx.x] = value;
+}
+
+__global__ void test_shfl_xor_array(int *d_out, int *d_in, int const mask){
+    int idx = threadIdx.x * SEGM; 
+    int value[SEGM];
+
+    for(int i = 0; i < SEGM; i++){
+        value[i] = d_in[idx+i];
+    }
+
+    value[0] = __shfl_xor(value[0], mask, BDIMX);
+    value[1] = __shfl_xor(value[1], mask, BDIMX);
+    value[2] = __shfl_xor(value[2], mask, BDIMX);
+    value[3] = __shfl_xor(value[3], mask, BDIMX);
+
+    for(int i = 0; i < SEGM; i++){
+        d_out[idx+i] = value[i];
+    }
+}
+
+__global__ void test_shfl_xor_array_swap (int *d_out, int *d_in, int const mask,
+    int srcIdx, int dstIdx)
+{
+    int idx = threadIdx.x * SEGM;
+    int value[SEGM];
+
+    for (int i = 0; i < SEGM; i++) value[i] = d_in[idx + i];
+
+    bool pred = ((threadIdx.x & 1) != mask);
+
+    printf("Threadidx.x is: %d pred is: %d \n", threadIdx.x, pred);
+
+    if (pred)
+    {
+        int tmp = value[srcIdx];
+        value[srcIdx] = value[dstIdx];
+        value[dstIdx] = tmp;
+    }
+
+    value[dstIdx] = __shfl_xor (value[dstIdx], mask, BDIMX);
+
+    if (pred)
+    {
+        int tmp = value[srcIdx];
+        value[srcIdx] = value[dstIdx];
+        value[dstIdx] = tmp;
+    }
+
+    for (int i = 0; i < SEGM; i++) d_out[idx + i] = value[i];
+}
+
+int main(int argc, char **argv)
+{
+    int dev = 0;
+    bool iPrintout = 1;
+
+    cudaDeviceProp deviceProp;
+    CHECK(cudaGetDeviceProperties(&deviceProp, dev));
+    printf("> %s Starting.", argv[0]);
+    printf("at Device %d: %s\n", dev, deviceProp.name);
+    CHECK(cudaSetDevice(dev));
+
+    int nElem = BDIMX;
+    int h_inData[BDIMX], h_outData[BDIMX];
+
+    for (int i = 0; i < nElem; i++) h_inData[i] = i;
+
+    if(iPrintout)
+    {
+        printf("initialData\t\t: ");
+        printData(h_inData, nElem);
+    }
+
+    size_t nBytes = nElem * sizeof(int);
+    int *d_inData, *d_outData;
+    CHECK(cudaMalloc((int**)&d_inData, nBytes));
+    CHECK(cudaMalloc((int**)&d_outData, nBytes));
+
+    CHECK(cudaMemcpy(d_inData, h_inData, nBytes, cudaMemcpyHostToDevice));
+
+    int block = BDIMX;
+
+    // shfl bcast
+    test_shfl_broadcast<<<1, block>>>(d_outData, d_inData, 2);
+    CHECK(cudaGetLastError());
+    CHECK(cudaMemcpy(h_outData, d_outData, nBytes, cudaMemcpyDeviceToHost));
+
+    if(iPrintout)
+    {
+        printf("shfl bcast\t\t: ");
+        printData(h_outData, nElem);
+    }
+
+    // shfl offset
+    test_shfl_wrap<<<1, block>>>(d_outData, d_inData, -2);
+    CHECK(cudaGetLastError());
+    CHECK(cudaMemcpy(h_outData, d_outData, nBytes, cudaMemcpyDeviceToHost));
+
+    if(iPrintout)
+    {
+        printf("shfl wrap right\t\t: ");
+        printData(h_outData, nElem);
+    }
+
+    // shfl up
+    test_shfl_up<<<1, block>>>(d_outData, d_inData, 2);
+    CHECK(cudaGetLastError());
+    CHECK(cudaMemcpy(h_outData, d_outData, nBytes, cudaMemcpyDeviceToHost));
+
+    if(iPrintout)
+    {
+        printf("shfl up \t\t: ");
+        printData(h_outData, nElem);
+    }
+
+    // shfl offset
+    test_shfl_wrap<<<1, block>>>(d_outData, d_inData, 2);
+    CHECK(cudaGetLastError());
+    CHECK(cudaMemcpy(h_outData, d_outData, nBytes, cudaMemcpyDeviceToHost));
+
+    if(iPrintout)
+    {
+        printf("shfl wrap left\t\t: ");
+        printData(h_outData, nElem);
+    }
+
+    // shfl down
+    test_shfl_down<<<1, block>>>(d_outData, d_inData, 2);
+    CHECK(cudaGetLastError());
+    CHECK(cudaMemcpy(h_outData, d_outData, nBytes, cudaMemcpyDeviceToHost));
+
+    if(iPrintout)
+    {
+        printf("shfl down \t\t: ");
+        printData(h_outData, nElem);
+    }
+
+    // shfl xor
+    test_shfl_xor<<<1, block>>>(d_outData, d_inData, 1);
+    CHECK(cudaGetLastError());
+    CHECK(cudaMemcpy(h_outData, d_outData, nBytes, cudaMemcpyDeviceToHost));
+
+    if(iPrintout)
+    {
+        printf("shfl xor 1\t\t: ");
+        printData(h_outData, nElem);
+    }
+
+    // shfl xor array
+    test_shfl_xor_array<<<1, block / SEGM>>>(d_outData, d_inData, 1);
+    CHECK(cudaGetLastError());
+    CHECK(cudaMemcpy(h_outData, d_outData, nBytes, cudaMemcpyDeviceToHost));
+
+    if(iPrintout)
+    {
+        printf("shfl array 1\t\t: ");
+        printData(h_outData, nElem);
+    }
+
+    // shfl xor - swap
+    test_shfl_xor_array_swap<<<1, block / SEGM>>>(d_outData, d_inData, 1, 0, 3);
+    CHECK(cudaGetLastError());
+    CHECK(cudaMemcpy(h_outData, d_outData, nBytes, cudaMemcpyDeviceToHost));
+
+    if(iPrintout)
+    {
+        printf("shfl swap 0 3\t\t: ");
+        printData(h_outData, nElem);
+    }
+
+    // finishing
+    CHECK(cudaFree(d_inData));
+    CHECK(cudaFree(d_outData));
+    CHECK(cudaDeviceReset();  );
+
+    return EXIT_SUCCESS;
+}

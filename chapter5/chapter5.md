@@ -209,6 +209,7 @@ __shared__ int tile[BDIMY][BDIMX];
 ```cpp
 __shared__ int tile[BDIMX][BDIMY];
 ```
+这里我们是以一个16x32的矩阵为示例，而针对列操作，处理的是16个元素，在k40里，存储体宽度是8个字，因此，16x4/8，需要8个存储体，从而有8路冲突
 
 ### 5.2.2.2 行主序写操作和列主序读操作
 我们实现一个矩阵转置操作
@@ -242,4 +243,433 @@ unsigned int irow = idx / blockDim.y;
 unsigned int icol = idx % blockDim.y;
 unsigned int col_idx = icol * blockDim.x + irow;
 ```
+### 5.2.2.4 填充静态声明的共享内存
+跟前面类似，这里不展开
 
+### 5.2.2.5 填充动态声明的共享内存
+跟前面类似，这里不展开
+
+# 5.3 减少全局内存访问
+## 5.3.1 使用共享内存的并行归约
+我们以`reduceGmem`核函数作为基准性能，具体可参考`reduceInteger.cu`
+
+接下来测试基于共享内存的核函数`reduceSmem`，主要区别是规约时候不用全局内存，而是将数据拷贝到共享内存
+
+## 5.3.2 使用展开的并行归约
+这里采取Unroll4，一次处理4个数据块
+
+## 5.3.3 使用动态共享内存的并行归约
+在Unroll函数中，用动态共享内存进行替代
+```cpp
+extern __shared__ int smem[];
+```
+运行速度上与静态声明的共享内存没什么差别
+
+## 5.3.4 有效带宽
+```
+有效带宽 = （读字节+写字节） / （运行时间*10^9） GB/s
+```
+
+# 5.4 合并的全局内存访问
+使用共享内存可以帮助避免对未合兵的全局内存访问
+
+我们以矩阵转置为例，读操作是可以合并的，但是写操作是交叉访问。为了提高性能，我们可以在共享内存完成转置操作，然后再写到全局内存
+
+## 5.4.1 基准转置内核
+我们以最朴素的方式实现基准转置内核
+```cpp
+#define INDEX(ROW, COL, INNER) ((ROW) * (INNER) + (COL))
+__global__ void copyGmem(float *out, float *in, const int nrows, const int ncols)
+{
+    // matrix coordinate (ix,iy)
+    unsigned int row = blockIdx.y * blockDim.y + threadIdx.y;
+    unsigned int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    // transpose with boundary test
+    if (row < nrows && col < ncols)
+    {
+		// NOTE this is a transpose, not a copy
+        out[INDEX(col, row, nrows)] = in[INDEX(row, col, ncols)];
+    }
+}
+```
+为了测试性能上界，我们设置了一个基于行顺序的拷贝的核函数 `copyGmem`
+
+## 5.4.2 使用共享内存的矩阵转置
+首先读取全局内存的一行，写入到共享内存的一行，然后读取一列，写入到全局内存的一行。虽然会导致共享内存存储体冲突，但还是会比我们以全局内存的朴素实现要好的。
+
+我这里的和书上提供的略微不一样
+```cpp
+__global__ void transposeSmem(float *out, float *in, int nrows, int ncols)
+{
+    __shared__ float tile[BDIMY][BDIMX];
+
+    unsigned int row = blockDim.y * blockIdx.y + threadIdx.y;  // 计算全局的行，列坐标
+    unsigned int col = blockDim.x * blockIdx.x + threadIdx.x; 
+
+    unsigned int offset = INDEX(row, col, ncols); // 计算全局的一维行方向索引
+
+    unsigned int bidx = threadIdx.y * blockDim.x + threadIdx.x; // 计算一个线程块内的索引
+    unsigned int irow = bidx / blockDim.y; // 转置，以3x4矩阵，编号为7的元素（从0开始），应在(1, 3)。这里转置后，变为4x3矩阵，第七个元素应该是(2, 1)。这里对应irow=2， icol=1
+    unsigned int icol = bidx % blockDim.y;
+    unsigned int transposed_offset = INDEX(col, row, nrows); // 转置后矩阵的偏移值
+    if(row < nrows && col < ncols){
+        tile[threadIdx.y][threadIdx.x] = in[offset];
+    }
+    __syncthreads();
+    
+    if(row < nrows && col < ncols){
+        out[transposed_offset] = tile[irow][icol];
+    }
+}
+```
+
+## 5.4.3 使用填充共享内存的矩阵转置
+```cpp
+__shared__ float tile[BDIMY][BDIMX+2];
+```
+
+## 5.4.4 使用展开的矩阵转置
+我们同时对两个数据块进行处理
+```cpp
+__global__ void transposeSmemUnroll(float *out, float *in, const int nrows, 
+                                            const int ncols) 
+{
+    __shared__ float tile[BDIMY][BDIMX * 2];
+
+    unsigned int row = blockIdx.y * blockDim.y + threadIdx.y;
+    unsigned int col = (2 * blockIdx.x * blockDim.x) + threadIdx.x; // 一次性在行方向上操作两个数据块，这个是第一个数据块的列index
+
+    unsigned int row2 = row;
+    unsigned int col2 = col + blockDim.x; // 第二个数据块的列index
+
+    // linear global memory index for original matrix
+    unsigned int offset = INDEX(row, col, ncols); // 计算全局的index
+    unsigned int offset2 = INDEX(row2, col2, ncols);
+
+    // thread index in transposed block
+    unsigned int bidx = threadIdx.y * blockDim.x + threadIdx.x;
+    unsigned int irow = bidx / blockDim.y;
+    unsigned int icol = bidx % blockDim.y;
+
+    unsigned int transposed_offset = INDEX(col, row, nrows); // 计算转置之后的索引
+    unsigned int transposed_offset2 = INDEX(col2, row2, nrows);
+
+    if (row < nrows && col < ncols)
+    {
+        tile[threadIdx.y][threadIdx.x] = in[offset];
+    }
+    if (row2 < nrows && col2 < ncols)
+    {
+        tile[threadIdx.y][blockDim.x + threadIdx.x] = in[offset2];
+    }
+
+    __syncthreads();
+
+    if (row < nrows && col < ncols)
+    {
+        out[transposed_offset] = tile[irow][icol];
+    }
+    if (row2 < nrows && col2 < ncols)
+    {
+        out[transposed_offset2] = tile[irow][blockDim.x + icol];
+    }
+}
+```
+# 5.5 常量内存
+常量内存是一种用于只读数据和统一访问线程束中线程的数据。**常量内存对内核代码而言是只读的，但它对主机是即可读又可写的。**
+
+常量内存在DRAM上，有一个专用的片上缓存，大小为64KB，读取延迟更低
+
+**常量内存的最优访问模式是：线程束中的所有线程都访问相同的位置**
+
+使用修饰符 `__constant__`
+
+因为设备只能读取常量内存，所以常量内存的值需通过 `cudaMemcpyToSymbol` 进行初始化
+
+## 5.5.1 使用常量内存实现一维模板
+我们尝试实现一个
+```
+f(x) = c0(f(x+4h)-f(x-4h)) + c1(f(x+3h)-f(x-3h)) + c2(f(x+2h)-f(x-2h)) + c3(f(x+h)-f(x-h)) + 
+```
+考虑到每个线程都需要读取系数c0-c3，所以我们考虑把其放到常量内存
+
+```cpp
+__constant__ float coef[RADIUS+1];
+
+// 定义系数
+#define a0 0.0000f
+...
+
+// 初始化常量内存的数据
+void setup_coef_constant(void){
+    const float h_coef[] = {a0, a1, a2, a3, a4};
+    CHECK(cudaMemcpyToSymbol(coef, h_coef, (RADIUS+1)*sizeof(float)));
+}
+
+__global__ void stencil_1d(float *in, float *out, int N){
+    __shared__ float smem[BDIM+2*RADIUS];
+
+    int idx = blockIdx.x * blockDim.x + threadIdx.x; 
+
+    while(idx < N){
+        int sidx = threadIdx.x + RADIUS; 
+        smem[sidx] = in[idx]; 
+        if (threadIdx.x < RADIUS){
+            // 前四个线程将RADIUS的数据读取到共享内存中
+            smem[sidx - RADIUS] = in[idx - RADIUS]; // 这里传入in的地址时候，是d_in + RADIUS，因此不会越界
+            smem[sidx + BDIM] = in[idx + BDIM];
+        }
+
+        __syncthreads();
+
+        float tmp = 0.0f; 
+        #pragma unroll // 提示编译器展开循环
+        for(int i = 1; i <= RADIUS; i++){
+            tmp += coef[i] * (smem[sidx + i] - smem[sidx - i]);
+        }
+        out[idx] = tmp; 
+        idx += gridDim.x * blockDim.x; 
+    }
+}
+```
+
+## 5.5.2 与只读缓存的比较
+kepler GPU使用GPU纹理流水线作为只读缓存，用于存储全局内存中的数据
+每个kepler SM有48KB的只读缓存，它在分散读取下，比一级缓存更好，当线程束中的线程都读取相同地址时，不应使用只读缓存。（因为只读缓存的粒度是**32字节**）
+
+有两种方法向编译器指出内核里，某些数据是只读的
+1. 使用函数 `__ldg`(这是一个更好的选择)
+它的作用相当于**标准的指针解引用**
+```cpp
+__global__ void kernel(float *output, float *in){
+    output[idx] += __ldg(&in[idx]);
+}
+```
+2. 使用全局内存的限定指针 `const __restrict__`
+```cpp
+void kernel(float* output, const float* __restrict__ input){
+    ...
+}
+```
+
+> 常量缓存加载的数据必须是相对较小的，而且访问必须一致以获得更好的性能
+> 只读缓存加载的数据可以是比较大的，而且能够在一个非统一的模式下进行访问
+
+tips: 
+- 常量缓存和只读缓存都是**只读的**
+- 每个SM上资源有限，常量缓存是64KB，只读缓存是48KB
+- 常量缓存在统一读取中更好（统一读取是指线程束中每一个线程访问相同地址），只读缓存更适合分散读取
+
+# 5.6 线程束洗牌指令
+洗牌指令机制是指：**只要两个线程在相同的线程束中，那么就允许这两个线程直接读取另一个线程的寄存器**
+
+这使得线程束中线程彼此可以直接交换数据，而不需要通过共享/全局内存，并且比共享内存有**更低的延迟**
+
+我们可以通过公式
+```cpp
+laneID = threadIdx.x % 32 // 束内线程索引（即线程束内第几个线程）
+warpID = threadIdx.x / 32 // 线程束索引（即第几个线程束）
+```
+
+## 5.6.1 线程束洗牌指令的不同形式
+线程束洗牌指令基于整型和浮点数有两组，每组有四种指令
+
+1. 在线程束内交换整型变量
+```cpp
+int __shfl(int var, int srcLane, int width=warpSize);
+```
+我们先看默认情况，即width=线程束大小32。
+**此时srcLane表示束内线程索引**，会让各个线程接收到srcLane这个线程的var变量
+```cpp
+__shfl(var, 2); // 此时所有线程接收到2号线程的var变量
+```
+我们再看更复杂的情况，其中width大小必须是2的指数（从2到32）
+**因为width可以小于32，所以会把线程束分成更小的单位————段**
+此时srcLane是基于每个段的偏移索引
+```cpp
+__shfl(var, 3, 16);
+```
+以16的宽度，我们线程束可以分成两段。
+其中第一段0-15线程，接受第3个线程的var变量（因为第一段起始为0，偏移3，0+3=3）
+
+而第二段16-31线程，接受第19个线程的var变量（因为第二段起始为16，偏移3，16+3=19）
+
+2. 在线程束内右移变量
+```cpp
+int __shfl_up(int var, unsigned int delta, int width=warpSize);
+```
+这里width和上面的是一样
+以
+```cpp
+__shfl_up(val, 2);
+```
+为例子
+它将0-29号线程的val变量右移2位(因为30，31号线程没地方移了)
+即 0~29 -> 2~31
+而 0，1号线程的变量保持不变
+
+3. 在线程束内左移变量
+```cpp
+int __shfl_down(int var, unsigned int delta, int width=warpSize);
+```
+与上面类似，不展开，只是改变了移动的方向
+
+4. 线程束内按位异或运算
+```cpp
+int __shfl_xnor(int var, int lanemask, int width=warpSize);
+```
+每个线程都与1异或
+```cpp
+000 ^ 001 = 001 // 0号线程去1号 
+001 ^ 001 = 000 // 1号线程去0号 
+010 ^ 001 = 011 // 2号线程去3号 
+011 ^ 001 = 010 // 3号线程去2号 
+```
+```cpp
+__shfl_xnor(val, 1); // 实现蝴蝶寻址模式
+```
+
+## 5.6.2 线程束内的共享数据
+### 5.6.2.1 跨线程束值的广播
+```cpp
+// 具体可参考simpleShuffle.cu中的test_shfl_broadcast
+```
+我们传入`srcLane=2`，它将2号线程的变量广播到所有线程中
+```
+initialData             :  0  1  2  3  4  5  6  7  8  9 10 11 12 13 14 15 
+shfl bcast              :  2  2  2  2  2  2  2  2  2  2  2  2  2  2  2  2 
+```
+
+### 5.6.2.2 线程束内上移
+```cpp
+// 具体可参考simpleShuffle.cu中的test_shfl_up
+
+initialData             :  0  1  2  3  4  5  6  7  8  9 10 11 12 13 14 15 
+shfl up                 :  0  1  0  1  2  3  4  5  6  7  8  9 10 11 12 13 
+```
+
+### 5.6.2.3 线程束内下移
+类似，这里不展开
+
+### 5.6.2.4 线程束内环绕移动
+我们通过设置`__shfl`指令中的srcLane为**当前线程ID+offset**进而实现环绕移动
+```cpp
+__global__ void test_shfl_wrap(int *d_out, int *d_in, int const offset){
+    int value = d_in[threadIdx.x];
+    value = __shfl(value, threadIdx.x+offset, BDIMX)
+    d_out[threadIdx.x] = value;
+}
+
+initialData             :  0  1  2  3  4  5  6  7  8  9 10 11 12 13 14 15 
+shfl wrap left          :  2  3  4  5  6  7  8  9 10 11 12 13 14 15  0  1 
+```
+### 5.6.2.5 跨线程束的蝴蝶交换
+省略
+
+### 5.6.2.6 跨线程束交换数组值
+我们让每个线程管理一个寄存器数组，然后交换各个数组的值
+```cpp
+__global__ void test_shfl_xor_array(int *d_out, int *d_in, int const mask){
+    int idx = threadIdx.x * SEGM; 
+    int value[SEGM];
+
+    for(int i = 0; i < SEGM; i++){
+        value[i] = d_in[idx+i];
+    }
+
+    value[0] = __shfl_xor(value[0], mask, BDIMX);
+    value[1] = __shfl_xor(value[1], mask, BDIMX);
+    value[2] = __shfl_xor(value[2], mask, BDIMX);
+    value[3] = __shfl_xor(value[3], mask, BDIMX);
+
+    for(int i = 0; i < SEGM; i++){
+        d_out[idx+i] = value[i];
+    }
+}
+
+shfl array :  4  5  6  7  0  1  2  3 12 13 14 15  8  9 10 11 
+```
+
+### 5.6.2.7 跨线程束使用数组索引交换数值
+我们尝试对每两个数组交换其首尾元素
+```cpp
+__global__ void test_shfl_xor_array_swap (int *d_out, int *d_in, int const mask,
+    int srcIdx, int dstIdx)
+{
+    int idx = threadIdx.x * SEGM;
+    int value[SEGM];
+
+    for (int i = 0; i < SEGM; i++) value[i] = d_in[idx + i];
+
+    bool pred = ((threadIdx.x & 1) != mask);
+
+    if (pred)
+    {
+        int tmp = value[srcIdx];
+        value[srcIdx] = value[dstIdx];
+        value[dstIdx] = tmp;
+    }
+
+    value[dstIdx] = __shfl_xor (value[dstIdx], mask, BDIMX);
+
+    if (pred)
+    {
+        int tmp = value[srcIdx];
+        value[srcIdx] = value[dstIdx];
+        value[dstIdx] = tmp;
+    }
+
+    for (int i = 0; i < SEGM; i++) d_out[idx + i] = value[i];
+}
+```
+首先我们一共有4个线程，每个线程管理自己的一个大小为4的数组
+
+然后分成两组，pred意思是，每一组的第一个线程为True
+
+第一组
+```
+原型： 0 1 2 3  4 5 6 7 
+针对第一个线程的数组，交换firstIdx和secondIdx(0, 3)：3 1 2 0  4 5 6 7
+针对secondIdx做蝴蝶交换：3 1 2 7  4 5 6 0
+再针对第一个线程的数组，交换firstIdx和secondIdx(0, 3) 7 1 2 3  4 5 6 0
+```
+对于第二组 `8 9 10 11 12 13 14 15`也是类似的流程
+
+## 5.6.3 使用线程束洗牌指令的并行归约
+归约分为三个层面
+1. 线程束级
+2. 线程块级
+3. 网格级
+
+针对线程束级别很简单，用到前面的蝴蝶交换
+```cpp
+__inline__ __device__ int warpReduce(int localSum)
+{
+    localSum += __shfl_xor(localSum, 16);
+    localSum += __shfl_xor(localSum, 8);
+    localSum += __shfl_xor(localSum, 4);
+    localSum += __shfl_xor(localSum, 2);
+    localSum += __shfl_xor(localSum, 1);
+
+    return localSum;
+}
+```
+然后保存到共享内存中
+```cpp
+int laneIdx = threadIdx.x % warpSize; 
+int warpIdx = threadIdx.x / warpSize; 
+mySum = warpReduce(mySum);
+if(laneIdx == 0) smem[warpIdx] = mySum; // 让每个线程束的第一个线程保存值
+```
+对于线程块级归约，先取出每个线程束的总和，然后将总和相加
+```cpp
+__syncthreads(); // 同步块
+mySum = (threadIdx.x < SMEMDIM) ? smem[laneIdx] : 0;
+if (warpIdx == 0) localSum = warpReduce(localSum); 
+```
+对于网格级归约，将输出复制回主机
+```cpp
+if (threadIdx.x == 0) g_odata[blockIdx.x] = localSum;
+```
+具体可参考`reduceIntegerShfl.cu`
