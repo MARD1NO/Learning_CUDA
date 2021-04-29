@@ -68,7 +68,7 @@ cudaError_t cudaStreamDestroy(cudaStream_t stream);
 CUDA提供两个函数来检查流中所有操作是否完成
 ```cpp
 cudaError_t cudaStreamSynchronize(cudaStream_t stream);
-cudaError_t cuudaStreamQuery(cudaStream_t stream);
+cudaError_t cudaStreamQuery(cudaStream_t stream);
 ```
 - `cudaStreamSynchronize` 强制阻塞主机，直到给定流中所有的操作都完成
 - `cudaStreamQuery` 会检查流中所有操作是否都已经完成
@@ -324,6 +324,7 @@ for (int i = 0; i < n_streams; i++)
     kernel_4<<<grid, block, 0, streams[i]>>>();
 }
 ```
+在非空流上所有之后的操作都会被阻塞
 
 ## 6.2.7 创建流间依赖关系
 我们可以使用同步事件来创建流之间的依赖关系
@@ -351,6 +352,121 @@ for (int i = 0; i < n_streams; i++)
     CHECK(cudaStreamWaitEvent(streams[n_streams - 1], kernelEvent[i], 0));
 }
 ```
+# 6.3 重叠内核执行和数据传输
+以Fermi GPU和Kepler GPU为例，它们有两个复制引擎队列：一个用于将数据传输到设备，另一个用于从设备将数据提取出来。因此最多可以**重叠两个数据传输**，且只有当它们的**方向不同，调度到不同的流**才能这么做
 
+我们还需要检验数据传输和内核执行之间的关系，以区分以下两种情况：
+- 如果一个内核使用数据A，那么对A进行数据传输必须安排在内核启动前，且需要处在相同的流
+- 如果一个内核完全不使用数据A，那么内核执行和数据传输可以位于不同的流中
 
+下面以向量加法示例来实现重叠数据传输和内核执行
+
+## 6.3.1 使用深度优先调度重叠
+> 为了让nvvp可视化变得更明显，我们给向量加法核函数额外增加了一个无用的for循环
+```cpp
+__global__ void sumArrays(float *A, float *B, float *C, const int N){
+    int idx = blockIdx.x * blockDim.x + threadIdx.x; 
+    if(idx < N){
+        for(int i = 0; i < n_repeat; i++){
+            C[idx] = A[idx] + B[idx]; 
+        }
+    }
+}
+```
+为了在向量加法实现重叠，我们将输入和输出数据集划分成子集，**将来自一个子集的通信与来自于其他自己的计算进行重叠**。即把长度为N的向量加法拆解为M个操作，每个操作执行N/M长度的加法
+
+为了重叠数据传输和内核执行，我们需要用到异步复制函数。前面提到异步复制函数需要固定的主机内存，因此需要用`cudaHostAlloc`函数来分配内存空间
+```cpp
+cudaHostAlloc((void **)&gpuRef, nBytes, cudaHostAllocDefault);
+cudaHostAlloc((void **)&hostRef, nBytes, cudaHostAllocDefault);
+```
+定义每个流处理的元素数量
+```cpp
+int iElem = nElem / NSTREAM; 
+```
+然后我们使用一个for循环来为几个流调度iElem个元素的通信和计算
+```cpp
+for(int i = 0; i < NSTREAM; i++){
+    int ioffset = i*iElem; 
+    cudaMemcpyAsync(&d_A[ioffset], &h_A[ioffset], iBytes, cudaMemcpyHostToDevice, stream[i]);
+    cudaMemcpyAsync(&d_B[ioffset], &h_B[ioffset], iBytes, cudaMemcpyHostToDevice, stream[i]);
+    sumArrays<<<grid, block, 0, stream[i]>>>(&d_A[ioffset], &d_B[ioffset], &d_C[ioffset], iElem);
+}
+```
+## 6.3.2 使用广度优先调度重叠
+下面的示例代码使用广度优先调度
+```cpp
+for(int i=0; i <NSTREAM; ++i){
+    int ioffset = i *iElem; 
+    cudaMemcpyAsync(&d_A[ioffset], &h_A[ioffset], iBytes, cudaHostToDevice, streams[i]); 
+    cudaMemcpyAsync(&d_B[ioffset], &h_B[ioffset], iBytes, cudaHostToDevice, streams[i]); 
+}
+
+for(int i=0; i <NSTREAM; ++i){
+    int ioffset = i *iElem; 
+    sumArrays<<<grid, block, 0, streams[i]>>>(&d_A[ioffset], &d_B[ioffset], &d_C[ioffset], iElem);
+}
+
+for(int i=0; i <NSTREAM; ++i){
+    int ioffset = i *iElem; 
+    cudaMemcpyAsync(&gpuRef[ioffset], &hostRef[ioffset], iBytes, cudaDeviceToHost, streams[i]); 
+}
+```
+# 6.4 重叠GPU和CPU执行
+实现GPU和CPU重叠比较简单，因为内核启动默认都是异步的，直接返回给主机
+我们先写一个内核实现简单的向量+标量
+```cpp
+__global__ void kernel(float *g_data, float value){
+    int idx = blockIdx.x * blockDim.x + threadIdx.x; 
+    g_data[idx] = g_data[idx] + value; 
+}
+```
+我们使用三个CUDA操作（两次memcpy，一次内核）
+```cpp
+cudaMemcpyAsync(d_a, h_a, nbytes, cudaMemcpyHostToDevice); 
+kernel<<<grid, block>>>(d_a, value);
+cudaMemcpyAsync(d_a, h_a, nbytes, cudaMemcpyHostToDevice); 
+cudaEventRecord(stop);
+```
+这些操作绑定在默认流
+
+操作权返回给主机，我们可以让主机在while循环里，查询事件是否完成，在循环体内做一个简单的累加
+```cpp
+unsigned long int counter = 0; 
+while(cudaEventQuery(stop) == cudaErrorNotReady){
+    counter ++; 
+}
+```
+
+# 6.5 流回调
+流回调是另一种可以到CUDA流中排列等待的操作。一旦流回调之前所有的流操作全部完成，被流回调指定的主机端函数就会被CUDA运行时所调用
+
+```cpp
+cudaError_t cudaStreamAddCallback(cudaStream_t stream, cudaStreamCallback_t callback, void *userData, unsigned int flags);
+```
+参数分别是CUDA流，回调函数，传入数据，flags参数（暂时用不到，直接给0）
+
+每使用`cudaStreamAddCallback`一次，只执行一次回调，**并阻塞队列中排在其后面的工作**，直到回调函数完成
+
+回调函数有两个限制： 
+- 对回调函数不可以调用CUDA的API函数
+- 在回调函数中不可以执行同步
+
+我们设置一个回调函数为
+```cpp
+void CUDART_CB my_callback(cudaStream_t stream, cudaError_t status, void *data){
+    printf("callback from stream %d \n", *((int *)data));
+}
+```
+为每个流添加回调
+```cpp
+for(int i = 0; i < n_streams; i++){
+    stream_ids[i] = i; 
+    kernel_1<<<grid, block, 0, streams[i]>>>(); 
+    kernel_2<<<grid, block, 0, streams[i]>>>(); 
+    kernel_3<<<grid, block, 0, streams[i]>>>(); 
+    kernel_4<<<grid, block, 0, streams[i]>>>(); 
+    cudaStreamAddCallback(streams[i], my_callback, (void *)(stream_ids + i), 0);
+}
+```
 
