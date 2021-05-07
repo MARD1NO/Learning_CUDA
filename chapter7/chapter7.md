@@ -124,3 +124,84 @@ CUDA还包含了一对用于控制FMAD指令生成的内部函数：`__fmul`和`
 - ru 向上取整
 - rd 向下取整
 
+## 7.2.3 了解原子指令
+### 7.2.3.1 从头开始
+我们以`原子级比较并交换运算符CAS(compare and swap)`作为示例
+
+CAS输入有：`内存地址，存储在此地址中的期望值，想要存储在该位置的新值`，然后执行：
+1. 读取目标地址，并将该处地址的存储值与预期值进行比较
+   - 如果存储值与预期值相等，那么新值将存入目标位置
+   - 如果存储值与预期值不等，那么目标位置不会发生变化
+2. 不论发生什么情况，一个CAS操作总是返回目标地址的值
+
+CUDA提供的`atomicCAS`函数为`int atomicCAS(int *address, int compare, int val)`, compare是预期值，val是实际想写入的新值
+
+我们利用该函数实现一个原子加法，自定义原子操作时，`定义目标的起始和结束状态是很有帮助的`
+
+对于原子加法来说，`起始状态是基值，结束状态为起始状态+增量的总和`
+
+对于原子加法，我们需要传入一个目的地址，和增量
+```cpp
+__device__ int myAtomicAdd(int *address, int incr){
+    int guess = *address;
+    int oldValue = atomicCAS(address, guess, guess + incr);
+    ...
+}
+```
+但是由于目标位置是多线程共享访问，所以另外一个线程有可能修改address的值。我们加入一个while循环来确保最终修改成功
+```cpp
+__device__ int myAtomicAdd(int *address, int incr)
+{
+    // Create an initial guess for the value stored at *address.
+    int guess = *address;
+    int oldValue = atomicCAS(address, guess, guess + incr);
+    // Loop while the guess is incorrect.
+    while (oldValue != guess)
+    {
+        guess = oldValue;
+        oldValue = atomicCAS(address, guess, guess + incr);
+    }
+    return oldValue;
+}
+```
+### 7.2.3.2 内置的CUDA原子函数
+忽略，查官网文档
+### 7.2.3.3 原子操作的成本
+原子函数在一些应用很有帮助，但可能**付出很高的性能代价**，原因如下：
+1. 当在全局或共享内存中执行原子操作时，能保证所有的数值变化对所有线程都是立即可见的。一个原子操作指令将通过任何方式进入到全局或共享内存中读取当前存储的数值，而不需要缓存
+2. 前面atomicAdd示例也提到。共享地址冲突的访问，需要让线程不断尝试，直到是正确的值（即atomicAdd的while循环）。如果应用程序反复循环致使IO开销较大，性能会降低
+3. 原子操作类似线程冲突的问题，一个线程束中只有一个线程的原子操作可以成功，其他线程必须重试。线程束中剩下的线程会等待所有原子操作完成，并且一个原子操作意味着一个全局的读写
+
+**只有在保证正确性前提下，才可以使用不安全访问**
+### 7.2.3.4 限制原子操作的性能成本
+让各线程块产生一个中间结果，然后使用原子操作将局部结果结合乘最终的全局结果
+### 7.2.3.5 原子级浮点支持
+原子函数**大多被声明在整型数值上操作**。只有atomicExch和atomicAdd支持单精度浮点数。
+如果涉及到浮点变量需要自己实现
+以一个单精度浮点数实现的`my-AtomicAdd`核函数为例
+```cpp
+__device__ float myAtomicAdd(float *address, float incr)
+{
+    unsigned int *typedAddress = (unsigned int *)address; 
+
+    float currentVal = *address; 
+    unsigned int expected = __float2uint_rn(currentVal);
+    unsigned int desired = __float2uint_rn(currentVal + incr);
+    printf("Desired is: %d \n", desired);
+
+    int oldIntValue = atomicCAS(typedAddress, expected, desired);
+    
+    // Loop while the guess is incorrect.
+    while (oldIntValue != expected)
+    {
+        expected = oldIntValue;
+        desired = __float2uint_rn(__uint2float_rn(oldIntValue)+incr);
+        oldIntValue = atomicCAS(typedAddress, expected, desired);
+    }
+    printf("Old int Value is: %d \n", oldIntValue);
+    return __uint2float_rn(oldIntValue);
+}
+```
+1. 使用强制转换，让address指针转换成uint类型
+2. 使用`__float2uint_rn`将各浮点数转换为包含相同比特位的unsigned int类型
+3. 返回结果转换为`float`类型，但是地址存的仍是int类型值 具体可参考`my-atomic-add-float.cu`（可能实现有误）
